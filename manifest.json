@@ -1,12 +1,12 @@
 {
   "name": "Saad's BDIX",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "Professional BDIX streaming sources for movies and series — fast, on-device, no backend.",
   "author": "Saad",
   "scrapers": [
     {
-      "id": "flixhub",
-      "name": "FlixHub",
+      "id": "flixhub1",
+      "name": "FlixHub2",
       "description": "Mainstream BDIX provider for movies and series with high-speed direct streams.",
       "version": "1.0.0",
       "author": "Saad",
