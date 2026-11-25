@@ -5,10 +5,10 @@
   "author": "Saad",
   "scrapers": [
     {
-      "id": "flixhub1",
-      "name": "FlixHub2",
-      "description": "Mainstream BDIX provider for movies and series with high-speed direct streams.",
-      "version": "1.0.0",
+      "id": "flixhub",
+      "name": "FlixHub",
+      "description": "FlixHub is a Mainstream BDIX provider for movies and series with high-speed direct streams.",
+      "version": "1.3.0",
       "author": "Saad",
       "supportedTypes": ["movie", "tv"],
       "filename": "providers/flixhub.js",
@@ -23,8 +23,8 @@
     {
       "id": "cineplex",
       "name": "CinePlex",
-      "description": "Mainstream BDIX movie and series provider with freshly resolved signed links.",
-      "version": "1.0.0",
+      "description": "Ultimate Destination for Movie Addicts.",
+      "version": "1.3.0",
       "author": "Saad",
       "supportedTypes": ["movie", "tv"],
       "filename": "providers/cineplex.js",
@@ -39,7 +39,7 @@
     {
       "id": "cinemax24",
       "name": "Cinemax24",
-      "description": "Mainstream BDIX catalogue matched by TMDB ID for accurate movie and series streams.",
+      "description": "Cinemax24 integreted Mainstream BDIX catalogue matched by TMDB ID for accurate movie and series streams.",
       "version": "1.0.0",
       "author": "Saad",
       "supportedTypes": ["movie", "tv"],
