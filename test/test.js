@@ -6,8 +6,8 @@ const realFetch = globalThis.fetch;
 const META = {
   '1': { title: 'Vibe', year: '2026-01-01', type: 'movie' },
   '1654566': { title: 'Vibe', year: '2026-09-18', type: 'movie', lang: 'ko' },
-  '773867': { title: 'Seoul Vibe', year: '2022-08-26', type: 'movie', lang: 'ko' },
-  '3': { title: 'Squid Game', year: '2021-01-01', type: 'tv' },
+  '773867': { title: 'Seoul Vibe', year: '2022-08-26', type: 'movie', lang: 'ko', imdb: 'tt13410882' },
+  '3': { title: 'Squid Game', year: '2021-01-01', type: 'tv', imdb: 'tt10919420' },
   '4': { title: 'Final Table', year: '2026-01-01', type: 'tv' },
   '5': { title: 'Seoul Vibe', year: '2022-01-01', type: 'movie' },
   '6': { title: 'Wandance', year: '2025-01-01', type: 'tv' },
@@ -21,9 +21,10 @@ globalThis.fetch = async function (url, options) {
   const m = u.match(/api\.themoviedb\.org\/3\/(movie|tv)\/(\d+)/);
   if (m) {
     const data = META[m[2]] || { title: 'Test', year: '2025-01-01', type: m[1] };
+    const external_ids = { imdb_id: data.imdb || '' };
     const body = m[1] === 'tv'
-      ? { name: data.title, original_name: data.title, first_air_date: data.year, original_language: data.lang || 'en' }
-      : { title: data.title, original_title: data.title, release_date: data.year, original_language: data.lang || 'en' };
+      ? { name: data.title, original_name: data.title, first_air_date: data.year, original_language: data.lang || 'en', external_ids }
+      : { title: data.title, original_title: data.title, release_date: data.year, original_language: data.lang || 'en', external_ids };
     return {
       ok: true,
       status: 200,
@@ -53,7 +54,7 @@ async function run(id, tmdbId, mediaType, season, episode) {
   const listing = streams.length
     ? streams.map((s, i) => {
         const tag = s._exact ? 'EXACT  ' : (Number(s._match) >= 40 ? 'CLOSE  ' : 'FALLBACK');
-        return '  ' + (i + 1) + '. ' + tag + ' ' + s.name;
+        return '  ' + (i + 1) + '. ' + tag + ' ' + String(s.name).replace(/^[\uFEFF\u200B]+/, '');
       }).join('\n')
     : '  (none)';
   console.log(
@@ -74,6 +75,8 @@ async function run(id, tmdbId, mediaType, season, episode) {
   await run('ctghall', '6', 'tv', 1, 1);
 
   if (process.env.TEST_LOCAL === '1') {
+    await run('dhakaflix', '773867', 'movie');
+    await run('dhakaflix', '3', 'tv', 1, 1);
     await run('wow-movie-zone', '7', 'movie');
     await run('wow-movie-zone', '8', 'tv', 1, 1);
   } else {

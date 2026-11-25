@@ -1,5 +1,7 @@
 /* FlixHub provider — appended after DF core by build.js. */
 
+var FLIXHUB_ORIGIN = 'https://flixhub.net/';
+
 async function getStreams(tmdbId, mediaType, season, episode) {
   if (DF.disabled('flixhub')) return [];
   var info = await DF.tmdbInfo(tmdbId, mediaType);
@@ -7,13 +9,13 @@ async function getStreams(tmdbId, mediaType, season, episode) {
 
   var candidates = [];
   var seen = {};
-  var terms = DF.searchTerms(info, 6);
-  for (var t = 0; t < terms.length && candidates.length < 20; t++) {
+  var terms = DF.searchTerms(info, 8);
+  for (var t = 0; t < terms.length && candidates.length < 24; t++) {
     try {
-      var url = 'https://flixhub.net/search/suggestions?q=' + encodeURIComponent(terms[t]);
-      var json = await DF.fetchJson(url);
+      var url = FLIXHUB_ORIGIN + 'search/suggestions?q=' + encodeURIComponent(terms[t]);
+      var json = await DF.fetchJson(url, DF.browserHeaders(FLIXHUB_ORIGIN));
       var rows = json.results || [];
-      for (var i = 0; i < rows.length && candidates.length < 20; i++) {
+      for (var i = 0; i < rows.length && candidates.length < 24; i++) {
         var r = rows[i];
         if (!r || !r.url || seen[r.url]) continue;
         if (/\/search\/resolve/i.test(r.url)) continue;
@@ -21,11 +23,12 @@ async function getStreams(tmdbId, mediaType, season, episode) {
         var year = parseInt(r.year, 10) || DF.yearOf(r.release_date || '');
         var type = r.content_type || r.type || '';
         var exactId = String(r.tmdb_id || '') === String(tmdbId);
-        var score = exactId ? 200 : DF.scoreMatch(title, year, info);
-        var exact = exactId || (DF.exactMatch(title, year, info) &&
+        var imdbId = info.imdbId && String(r.imdb_id || '') === String(info.imdbId);
+        var score = exactId || imdbId ? 200 : DF.scoreMatch(title, year, info);
+        var exact = exactId || imdbId || (DF.exactMatch(title, year, info) &&
           (!type || !info.mediaType || type === info.mediaType));
         if (type && info.mediaType && type !== info.mediaType) score = Math.max(0, score - 25);
-        if (score < 0) continue;
+        if (score <= 0) continue;
         seen[r.url] = true;
         candidates.push({
           url: r.url,
@@ -39,41 +42,44 @@ async function getStreams(tmdbId, mediaType, season, episode) {
     } catch (e) { /* next term */ }
   }
 
-  var chosen = DF.pickBest(candidates, info, DF.MAX_STREAMS, 0);
+  var chosen = DF.orderedCandidates(candidates, info, 8);
   if (!chosen.length) return [];
 
+  var watchHeaders = DF.browserHeaders(FLIXHUB_ORIGIN);
+  var playHeaders = DF.videoHeaders(FLIXHUB_ORIGIN);
+  var batches = await DF.hydrateMany(chosen, async function (candidate) {
+    var found = [];
+    var page = candidate.url;
+    var html = await DF.fetchText(page, watchHeaders);
+    var re = /<source[^>]+src=["']([^"']+)["'][^>]*>/gi;
+    var m;
+    while ((m = re.exec(html)) !== null && found.length < 8) {
+      var rawSrc = DF.decodeEntities(m[1]);
+      if (DF.isBroken(rawSrc)) continue;
+      var src = /^https?:\/\//i.test(rawSrc) ? rawSrc : DF.absoluteUrl(page, rawSrc);
+      if (!/\/stream\//i.test(src) && !DF.isVideo(src)) continue;
+      var label = info.mediaType === 'tv'
+        ? 'S' + DF.pad2(season) + 'E' + DF.pad2(episode) + ' • ' + candidate.title
+        : candidate.title;
+      var size = await DF.probeSize(src, playHeaders);
+      var stream = DF.makeStream({
+        name: 'FlixHub',
+        title: label,
+        url: src,
+        quality: DF.qualityOf(m[0] + ' ' + src),
+        detail: { raw: m[0] + ' ' + src, size: size },
+        headers: playHeaders,
+        match: candidate.score,
+        exact: candidate.exact
+      });
+      if (stream) found.push(stream);
+    }
+    return found;
+  });
+
   var out = [];
-  var headers = { 'User-Agent': DF.UA, 'Referer': 'https://flixhub.net/' };
-  for (var k = 0; k < chosen.length && out.length < DF.MAX_STREAMS; k++) {
-    try {
-      var page = chosen[k].url;
-      var html = await DF.fetchText(page);
-      var re = /<source[^>]+src=["']([^"']+)["'][^>]*>/gi;
-      var m;
-      var n = 0;
-      while ((m = re.exec(html)) !== null && out.length < DF.MAX_STREAMS && n < DF.MAX_STREAMS) {
-        var rawSrc = DF.decodeEntities(m[1]);
-        var src = /^https?:\/\//i.test(rawSrc) ? rawSrc : DF.absoluteUrl(page, rawSrc);
-        if (!/\/stream\//i.test(src) && !DF.isVideo(src)) { n++; continue; }
-        var label = info.mediaType === 'tv'
-          ? 'S' + DF.pad2(season) + 'E' + DF.pad2(episode) + ' • ' + chosen[k].title
-          : chosen[k].title;
-        var raw = m[0] + ' ' + src;
-        var size = await DF.probeSize(src, headers);
-        var s = DF.makeStream({
-          name: 'FlixHub',
-          title: label,
-          url: src,
-          quality: DF.qualityOf(raw),
-          detail: { raw: raw, size: size },
-          headers: headers,
-          match: chosen[k].score,
-          exact: chosen[k].exact
-        });
-        if (s) out.push(s);
-        n++;
-      }
-    } catch (e) { /* next candidate */ }
+  for (var b = 0; b < batches.length && out.length < 16; b++) {
+    for (var k = 0; k < batches[b].length && out.length < 16; k++) out.push(batches[b][k]);
   }
   return DF.rankStreams(DF.dedupe(out), info);
 }

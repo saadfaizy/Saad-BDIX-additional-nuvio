@@ -1,5 +1,20 @@
 /* CinePlex provider — appended after DF core by build.js. */
 
+var CINEPLEX_ORIGIN = 'http://cineplexbd.net/';
+
+function cineplexSources(html, pageUrl) {
+  var out = [];
+  var m;
+  var srcRe = /(?:const\s+videoSrc\s*=\s*|["']videoSrc["']\s*:\s*)["']([^"']+)["']/gi;
+  while ((m = srcRe.exec(html)) !== null) out.push(DF.decodeEntities(m[1]));
+  var tagRe = /<source[^>]+src=["']([^"']+)["'][^>]*>/gi;
+  while ((m = tagRe.exec(html)) !== null) out.push(DF.decodeEntities(m[1]));
+  var directRe = /["'](https?:\/\/[^"']+\.(?:mp4|mkv|m3u8)(?:\?[^"']*)?)["']/gi;
+  while ((m = directRe.exec(html)) !== null) out.push(DF.decodeEntities(m[1]));
+  return out.map(function (raw) { return DF.absoluteUrl(pageUrl, raw); })
+    .filter(function (url) { return !DF.isBroken(url) && DF.isVideo(url); });
+}
+
 async function getStreams(tmdbId, mediaType, season, episode) {
   if (DF.disabled('cineplex')) return [];
   var info = await DF.tmdbInfo(tmdbId, mediaType);
@@ -7,14 +22,14 @@ async function getStreams(tmdbId, mediaType, season, episode) {
 
   var candidates = [];
   var seen = {};
-  var terms = DF.searchTerms(info, 6);
-  for (var t = 0; t < terms.length && candidates.length < 20; t++) {
+  var terms = DF.searchTerms(info, 8);
+  for (var t = 0; t < terms.length && candidates.length < 24; t++) {
     try {
-      var url = 'http://cineplexbd.net/search.php?name=' + encodeURIComponent(terms[t]);
-      var html = await DF.fetchText(url);
+      var url = CINEPLEX_ORIGIN + 'search.php?name=' + encodeURIComponent(terms[t]);
+      var html = await DF.fetchText(url, DF.browserHeaders(CINEPLEX_ORIGIN));
       var re = /<a[^>]+href=["']([^"']*view\.php[^"']*)["'][^>]*>([\s\S]*?)<\/a>/gi;
       var m;
-      while ((m = re.exec(html)) !== null && candidates.length < 20) {
+      while ((m = re.exec(html)) !== null && candidates.length < 24) {
         var block = m[2];
         var imgMatch = block.match(/<img[^>]*>/i);
         var title = imgMatch ? DF.attr(imgMatch[0], 'alt') : '';
@@ -24,7 +39,7 @@ async function getStreams(tmdbId, mediaType, season, episode) {
         if (seen[href]) continue;
         var year = DF.yearOf(title);
         var score = DF.scoreMatch(title, year, info);
-        if (score < 20) continue;
+        if (score <= 0) continue;
         seen[href] = true;
         candidates.push({
           url: href,
@@ -38,50 +53,53 @@ async function getStreams(tmdbId, mediaType, season, episode) {
     } catch (e) { /* next term */ }
   }
 
-  var chosen = DF.pickBest(candidates, info, DF.MAX_STREAMS, 0);
+  var chosen = DF.orderedCandidates(candidates, info, 8);
   if (!chosen.length) return [];
 
-  var out = [];
-  var headers = { 'User-Agent': DF.UA, 'Referer': 'http://cineplexbd.net/' };
-  for (var k = 0; k < chosen.length && out.length < DF.MAX_STREAMS; k++) {
-    try {
-      var viewUrl = chosen[k].url;
-      var viewHtml = await DF.fetchText(viewUrl);
-      var hrefMatch = viewHtml.match(/href=["']([^"']*player\.php[^"']*)["']/i);
-      var playerUrl = hrefMatch
-        ? DF.absoluteUrl(viewUrl, DF.decodeEntities(hrefMatch[1]))
-        : viewUrl;
-      var playerHtml = playerUrl === viewUrl ? viewHtml : await DF.fetchText(playerUrl);
-      var label = info.mediaType === 'tv'
-        ? 'S' + DF.pad2(season) + 'E' + DF.pad2(episode) + ' • ' + chosen[k].title
-        : chosen[k].title;
+  var watchHeaders = DF.browserHeaders(CINEPLEX_ORIGIN);
+  var playHeaders = DF.videoHeaders(CINEPLEX_ORIGIN);
+  var batches = await DF.hydrateMany(chosen, async function (candidate) {
+    var found = [];
+    var viewHtml = await DF.fetchText(candidate.url, watchHeaders);
+    var pages = [];
+    var re = /href=["']([^"']*player\.php[^"']*)["']/gi;
+    var m;
+    while ((m = re.exec(viewHtml)) !== null && pages.length < 4) {
+      pages.push(DF.absoluteUrl(candidate.url, DF.decodeEntities(m[1])));
+    }
+    pages.push(candidate.url);
 
-      var rawSources = [];
-      var srcRe = /(?:const\s+videoSrc\s*=\s*|["']videoSrc["']\s*:\s*)["']([^"']+)["']/gi;
-      var sm;
-      while ((sm = srcRe.exec(playerHtml)) !== null) rawSources.push(DF.decodeEntities(sm[1]));
-      var tagRe = /<source[^>]+src=["']([^"']+)["'][^>]*>/gi;
-      while ((sm = tagRe.exec(playerHtml)) !== null) rawSources.push(DF.decodeEntities(sm[1]));
+    var htmls = await DF.hydrateMany(pages, async function (pageUrl) {
+      return { url: pageUrl, html: await DF.fetchText(pageUrl, watchHeaders) };
+    });
+    var label = info.mediaType === 'tv'
+      ? 'S' + DF.pad2(season) + 'E' + DF.pad2(episode) + ' • ' + candidate.title
+      : candidate.title;
 
-      for (var s = 0; s < rawSources.length && out.length < DF.MAX_STREAMS; s++) {
-        var rawSrc = rawSources[s];
-        var src = DF.absoluteUrl(playerUrl, rawSrc);
-        if (!DF.isVideo(src)) continue;
-        var raw = rawSrc + ' ' + src;
-        var size = await DF.probeSize(src, headers);
+    for (var h = 0; h < htmls.length && found.length < 8; h++) {
+      var srcs = cineplexSources(htmls[h].html, htmls[h].url);
+      for (var s = 0; s < srcs.length && found.length < 8; s++) {
+        var src = srcs[s];
+        var size = await DF.probeSize(src, playHeaders);
         var stream = DF.makeStream({
           name: 'CinePlex',
           title: label,
           url: src,
-          quality: DF.qualityOf(raw),
-          detail: { raw: raw, size: size },
-          headers: headers,
-          match: chosen[k].score,
-          exact: chosen[k].exact
+          quality: DF.qualityOf(src),
+          detail: { raw: src, size: size },
+          headers: playHeaders,
+          match: candidate.score,
+          exact: candidate.exact
         });
-        if (stream) out.push(stream);
+        if (stream) found.push(stream);
       }
-    } catch (e) { /* next candidate */ }
+    }
+    return found;
+  });
+
+  var out = [];
+  for (var b = 0; b < batches.length && out.length < 16; b++) {
+    for (var k = 0; k < batches[b].length && out.length < 16; k++) out.push(batches[b][k]);
   }
   return DF.rankStreams(DF.dedupe(out), info);
 }

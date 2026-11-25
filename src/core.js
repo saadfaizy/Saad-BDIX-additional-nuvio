@@ -3,6 +3,8 @@ var DF = (function () {
   var UA = 'Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 Chrome/120 Mobile Safari/537.36';
   var VIDEO_EXT = ['mp4', 'mkv', 'webm', 'avi', 'mov', 'm4v', 'ts', 'm3u8'];
   var MAX_STREAMS = 5;
+  var MAX_PER_QUALITY = 2;
+  var MAX_PER_HOST = 3;
 
   var ACCENTS = {
     'à':'a','á':'a','â':'a','ã':'a','ä':'a','å':'a','è':'e','é':'e','ê':'e','ë':'e',
@@ -46,6 +48,25 @@ var DF = (function () {
     return await res.json();
   }
 
+  // Tries alternate hosts in order. The caller supplies path + query; this is
+  // on-device only and never introduces a backend/proxy/tunnel.
+  async function tryHosts(hosts, path, options) {
+    var opts = options || {};
+    var lastError;
+    for (var i = 0; i < (hosts || []).length; i++) {
+      var base = String(hosts[i] || '').replace(/\/$/, '');
+      if (!base) continue;
+      var url = base + (String(path || '').charAt(0) === '/' ? '' : '/') + String(path || '');
+      try {
+        if (opts.body != null) return await postJson(url, opts.body, opts.headers);
+        return await fetchText(url, opts.headers);
+      } catch (e) {
+        lastError = e;
+      }
+    }
+    throw lastError || new Error('No hosts available');
+  }
+
   function decodeEntities(text) {
     return String(text || '')
       .split('&amp;').join('&')
@@ -79,6 +100,7 @@ var DF = (function () {
   function normalizeTitle(text) {
     var s = decodeEntities(String(text || '')).toLowerCase();
     for (var k in ACCENTS) s = s.split(k).join(ACCENTS[k]);
+    s = s.replace(/\bs\d{1,2}[\s._-]?e\d{1,3}\b/gi, ' ');
     s = s.replace(/\b(19\d{2}|20\d{2}|720p|1080p|2160p|4k|webrip|web-rip|webdl|web-dl|bluray|brrip|bdrip|hdtc|hdts|nf|amzn|dual|dua|multi|audio|dubbed|dub|subbed|subs?|esub|msubs?|soft|english|eng|hindi|hin|bengali|bangla|ben|tamil|tam|telugu|tel|korean|kor|japanese|jpn|chinese|chi|spanish|spa|french|fre|urdu|x264|x265|h264|h265|hevc|avc|aac|ddp5|atmos|10bit|hdr|mkv|mp4)\b/gi, ' ');
     s = s.replace(/[^a-z0-9]+/g, ' ');
     return s.replace(/\s+/g, ' ').trim();
@@ -291,6 +313,21 @@ var DF = (function () {
     return { season: parseInt(m[1], 10), episode: parseInt(m[2], 10) };
   }
 
+  // Handles folder layouts such as "Season 01/02.mkv" and "E02" filenames
+  // that do not contain a full SxxEyy token.
+  function episodeFromPath(text) {
+    var s = decodePath(text);
+    var direct = episodeOf(s);
+    if (direct) return direct;
+    var seasonFolder = s.match(/Season[\s._-]*(\d{1,2})[\/\].*?(?:Episode|EP)?[\s._-]*(\d{1,3})(?=\D|$)/i);
+    if (seasonFolder) {
+      return { season: parseInt(seasonFolder[1], 10), episode: parseInt(seasonFolder[2], 10) };
+    }
+    var epOnly = s.match(/(?:^|[\/\s\[\-])E(?:P)?[\s._-]*(\d{1,3})(?=\D|$)/i);
+    if (epOnly) return { season: null, episode: parseInt(epOnly[1], 10) };
+    return null;
+  }
+
   function pad2(n) {
     var s = String(n || 0);
     return s.length === 1 ? '0' + s : s;
@@ -311,11 +348,14 @@ var DF = (function () {
     var type = mediaType === 'tv' || mediaType === 'series' || mediaType === 'show' ? 'tv' : 'movie';
     var key = '';
     try { key = globalThis.TMDB_API_KEY || ''; } catch (e) { key = ''; }
-    var empty = { titles: [], year: null, tmdbId: String(tmdbId), mediaType: type, originalLanguage: '' };
+    var empty = {
+      titles: [], year: null, tmdbId: String(tmdbId), mediaType: type,
+      originalLanguage: '', imdbId: ''
+    };
     if (!key) return empty;
 
     var url = 'https://api.themoviedb.org/3/' + type + '/' + encodeURIComponent(tmdbId) +
-      '?api_key=' + encodeURIComponent(key) + '&language=en-US';
+      '?api_key=' + encodeURIComponent(key) + '&language=en-US&append_to_response=external_ids';
     try {
       var data = await fetchJson(url);
       var a = data.title || data.name || data.original_title || data.original_name || '';
@@ -325,19 +365,21 @@ var DF = (function () {
         if (t && titles.indexOf(t) < 0) titles.push(t);
       });
       var date = data.release_date || data.first_air_date || '';
+      var ids = data.external_ids || {};
       return {
         titles: titles,
         year: yearOf(date),
         tmdbId: String(tmdbId),
         mediaType: type,
-        originalLanguage: String(data.original_language || '')
+        originalLanguage: String(data.original_language || ''),
+        imdbId: String(ids.imdb_id || '')
       };
     } catch (e) {
       return empty;
     }
   }
 
-  function searchTerms(info, limit) {
+  function searchTerms(info, limit, h5ai) {
     var out = [];
     function add(value) {
       var s = String(value || '').trim();
@@ -345,15 +387,23 @@ var DF = (function () {
     }
     var titles = (info && info.titles) || [];
     for (var i = 0; i < titles.length; i++) {
-      add(titles[i]);
-      add(String(titles[i]).replace(/^(the|a|an)\s+/i, ''));
-      var words = String(titles[i]).split(/\s+/);
+      var title = String(titles[i]);
+      add(title);
+      add(title.replace(/^(the|a|an)\s+/i, ''));
+      add(title.replace(/[,:;!?'\u2019]/g, '').replace(/\s+/g, ' ').trim());
+      if (h5ai) {
+        add(title.replace(/\s+/g, '.'));
+        add(title.replace(/\s+/g, '_'));
+      }
+      var words = title.split(/\s+/);
+      if (words.length > 2) add(words.slice(0, 2).join(' '));
       for (var w = 0; w < words.length; w++) {
         var word = words[w].replace(/[^a-z0-9]/gi, '');
         if (word.length < 2) continue;
         if (word.length > 3) add(word.slice(0, 3));
         add(word.slice(0, 2));
       }
+      if (h5ai) add(title.replace(/ /g, '\\ '));
     }
     return out.slice(0, limit || 8);
   }
@@ -409,6 +459,214 @@ var DF = (function () {
     return VIDEO_EXT.indexOf(extOf(url)) >= 0;
   }
 
+  function browserHeaders(origin, extra) {
+    var ref = origin ? String(origin) : '';
+    if (ref && !/\/$/.test(ref)) ref += '/';
+    var h = {
+      'User-Agent': UA,
+      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      'Accept-Language': 'en-US,en;q=0.9'
+    };
+    if (ref) h.Referer = ref;
+    return Object.assign(h, extra || {});
+  }
+
+  function videoHeaders(origin, extra) {
+    var ref = origin ? String(origin) : '';
+    if (ref && !/\/$/.test(ref)) ref += '/';
+    var h = {
+      'User-Agent': UA,
+      'Accept': 'video/webm,video/ogg,video/*;q=0.9,*/*;q=0.5',
+      'Accept-Language': 'en-US,en;q=0.9',
+      'Accept-Encoding': 'identity'
+    };
+    if (ref) h.Referer = ref;
+    return Object.assign(h, extra || {});
+  }
+
+  function hostOf(url) {
+    var m = String(url || '').match(/^([a-z]+:\/\/[^/]+)/i);
+    return m ? m[1].toLowerCase() : '';
+  }
+
+  function isBroken(link) {
+    if (!link) return true;
+    var obj = typeof link === 'string' ? {} : link;
+    var raw = typeof link === 'string' ? link :
+      (obj.url || obj.href || obj.file || obj.src || obj.link || '');
+    var s = String(raw || '').trim();
+    if (!s || /^(null|undefined|none|n\/a|#)$/i.test(s)) return true;
+    if (obj.broken === true || obj.dead === true || obj.disabled === true) return true;
+    return false;
+  }
+
+  function sortTag(rank, max) {
+    var top = Math.max(1, Number(max) || 5);
+    var inv = Math.max(0, top - (Number(rank) || 0));
+    var bin = inv.toString(2);
+    while (bin.length < 20) bin = '0' + bin;
+    return bin.split('').map(function (b) {
+      return b === '1' ? '\uFEFF' : '\u200B';
+    }).join('');
+  }
+
+  function applySortTags(streams) {
+    var list = streams || [];
+    var max = Math.max(0, list.length - 1);
+    for (var i = 0; i < list.length; i++) {
+      var s = list[i];
+      if (!s || s._sortTagged) continue;
+      // Best rows receive more U+FEFF bits, matching Eclipsia's ordering trick.
+      var tag = sortTag(i, max);
+      s.name = tag + String(s.name || '');
+      s.title = tag + String(s.title || '');
+      markHidden(s, '_sortTagged', true);
+    }
+    return list;
+  }
+
+  function limitStreams(streams, perQuality, perHost) {
+    var pq = perQuality || MAX_PER_QUALITY;
+    var ph = perHost || MAX_PER_HOST;
+    var qCount = {};
+    var hCount = {};
+    var out = [];
+    for (var i = 0; i < (streams || []).length; i++) {
+      var s = streams[i];
+      if (!s || !s.url) continue;
+      var host = hostOf(s.url);
+      var qk = String(s.quality || 'HD') + '|' + host;
+      qCount[qk] = (qCount[qk] || 0) + 1;
+      if (qCount[qk] > pq) continue;
+      if (host) {
+        hCount[host] = (hCount[host] || 0) + 1;
+        if (hCount[host] > ph) continue;
+      }
+      out.push(s);
+    }
+    return out;
+  }
+
+  function groupExact(items, info) {
+    var groups = {};
+    var order = [];
+    for (var i = 0; i < (items || []).length; i++) {
+      var it = items[i];
+      if (!it || !it.title) continue;
+      var key = normalizeTitle(it.title) + '|' + (it.year || '');
+      if (!groups[key]) {
+        groups[key] = { title: it.title, year: it.year, score: 0, exact: false, items: [] };
+        order.push(key);
+      }
+      var g = groups[key];
+      g.items.push(it);
+      var score = typeof it.score === 'number' ? it.score : scoreMatch(it.title, it.year, info);
+      if (score > g.score) g.score = score;
+      if (it.exact || exactMatch(it.title, it.year, info) || score >= 85) g.exact = true;
+    }
+    var out = [];
+    for (var j = 0; j < order.length; j++) out.push(groups[order[j]]);
+    out.sort(function (a, b) {
+      var exact = (b.exact ? 1 : 0) - (a.exact ? 1 : 0);
+      if (exact) return exact;
+      return b.score - a.score;
+    });
+    return out;
+  }
+
+  // Group every exact/same-title candidate before any detail page is opened,
+  // so variants are hydrated in parallel and ranked together.
+  function orderedCandidates(items, info, limit) {
+    var scored = [];
+    for (var i = 0; i < (items || []).length; i++) {
+      var it = items[i];
+      if (!it || !it.title) continue;
+      if (typeof it.score !== 'number') it.score = scoreMatch(it.title, it.year, info);
+      if (it.score <= 0) continue;
+      scored.push(it);
+    }
+    var groups = groupExact(scored, info);
+    var out = [];
+    for (var g = 0; g < groups.length; g++) {
+      var groupItems = groups[g].items.slice();
+      groupItems.sort(function (a, b) { return b.score - a.score; });
+      for (var j = 0; j < groupItems.length; j++) out.push(groupItems[j]);
+    }
+    return out.slice(0, limit || 8);
+  }
+
+  async function hydrateMany(items, loader) {
+    var jobs = [];
+    for (var i = 0; i < (items || []).length; i++) {
+      (function (item) {
+        jobs.push(Promise.resolve().then(function () {
+          return loader(item);
+        }).catch(function () {
+          return null;
+        }));
+      })(items[i]);
+    }
+    var out = await Promise.all(jobs);
+    return out.filter(function (x) { return !!x; });
+  }
+
+  function firstNumber(obj, keys) {
+    if (!obj) return null;
+    for (var i = 0; i < keys.length; i++) {
+      var v = obj[keys[i]];
+      if (v == null) continue;
+      var m = String(v).match(/\d+/);
+      if (m) return parseInt(m[0], 10);
+    }
+    return null;
+  }
+
+  function episodeSourceText(ep) {
+    if (!ep) return '';
+    return String(ep.title || ep.name || ep.file_path || ep.path || ep.filename || '');
+  }
+
+  function seasonOfEpisode(ep) {
+    var s = firstNumber(ep, ['season', 'seasonNumber', 'season_number', 'seasonNum']);
+    if (s) return s;
+    var parsed = episodeOf(episodeSourceText(ep));
+    return parsed ? parsed.season : null;
+  }
+
+  function episodeNumberOf(ep) {
+    var n = firstNumber(ep, ['episode', 'episodeNumber', 'episode_number', 'epNum', 'number', 'absolute_number', 'abs']);
+    if (n) return n;
+    var parsed = episodeOf(episodeSourceText(ep));
+    return parsed ? parsed.episode : null;
+  }
+
+  function episodeLinks(episodes, season, episode) {
+    var out = [];
+    var wantSeason = parseInt(season, 10) || null;
+    var wantEpisode = parseInt(episode, 10) || null;
+    for (var i = 0; i < (episodes || []).length; i++) {
+      var ep = episodes[i];
+      if (!ep) continue;
+      var s = seasonOfEpisode(ep);
+      var n = episodeNumberOf(ep);
+      if (wantSeason && s && s !== wantSeason) continue;
+      if (wantEpisode && n && n !== wantEpisode) continue;
+      var links = ep.links || ep.sources || ep.files || [];
+      if (!Array.isArray(links) && links && typeof links === 'object') links = [links];
+      if (!links.length) {
+        var direct = ep.url || ep.video_path || ep.file || ep.src || ep.link;
+        if (direct) links = [{ url: direct }];
+      }
+      for (var j = 0; j < links.length; j++) {
+        var link = links[j];
+        if (isBroken(link)) continue;
+        var url = String(link.url || link.href || link.file || link.src || link.link || '').trim();
+        if (url) out.push({ url: url, link: link, season: s, episode: n, source: ep });
+      }
+    }
+    return out;
+  }
+
   function markHidden(stream, key, value) {
     if (value == null) return;
     try {
@@ -444,6 +702,7 @@ var DF = (function () {
       quality: quality,
       headers: o.headers || { 'User-Agent': UA }
     };
+    if (extra) stream.size = extra;
     if (/\.m3u8(\?|$)/i.test(o.url)) stream.type = 'hls';
     if (o.subtitles && o.subtitles.length) stream.subtitles = o.subtitles;
     if (typeof o.match === 'number') markHidden(stream, '_match', o.match);
@@ -495,7 +754,7 @@ var DF = (function () {
   }
 
   function rankStreams(streams, info) {
-    var ranked = (streams || []).slice();
+    var ranked = limitStreams(dedupe(streams || [])).slice();
     ranked.sort(function (a, b) {
       var exact = ((b && b._exact) ? 1 : 0) - ((a && a._exact) ? 1 : 0);
       if (exact) return exact;
@@ -520,8 +779,8 @@ var DF = (function () {
     }
     // Accuracy first: never place a closest-title fallback in the first two
     // rows. If fewer than two exact files exist, return only the exact ones.
-    if (exact.length < 2) return exact;
-    return ranked.slice(0, MAX_STREAMS);
+    if (exact.length < 2) return applySortTags(exact);
+    return applySortTags(ranked.slice(0, MAX_STREAMS));
   }
 
   async function h5aiSearch(origin, rootHref, query) {
@@ -539,95 +798,162 @@ var DF = (function () {
     return out;
   }
 
-  async function h5aiStreams(origin, rootHref, sourceName, info, mediaType, season, episode, disabledId) {
+  function h5aiCandidate(href, origin, rootHref, info, mediaType, season, episode) {
+    if (!isVideo(href) && !/\.m3u8(\?|$)/i.test(href)) return null;
+    var raw = decodePath(href);
+    var parts = raw.split('/');
+    // Episode files often sit in generic "Season 1" folders. Walk up to the
+    // first meaningful folder (usually the release/show folder).
+    var folder = '';
+    for (var p = parts.length - 2; p >= 0; p--) {
+      var seg = decodePath(parts[p] || '');
+      if (!seg) continue;
+      if (/^(season|episodes?|s\d{1,2})$/i.test(seg)) continue;
+      folder = seg;
+      break;
+    }
+    var fileLabel = cleanName(parts[parts.length - 1]);
+    var folderLabel = cleanName(folder || parts[parts.length - 1]);
+    var year = yearOf(raw) || yearOf(folderLabel);
+    var fileScore = scoreMatch(fileLabel, year, info);
+    var folderScore = scoreMatch(folderLabel, year, info);
+    var score = Math.max(fileScore, folderScore, strictScore(fileLabel, year, info));
+    // Episode filenames add SxxEyy tokens, so a strict title+year score is
+    // also treated as an exact/same-title match for the accuracy gate.
+    var exact = exactMatch(fileLabel, year, info) || exactMatch(folderLabel, year, info) || score >= 85;
+    if (score < 40 && !exact) return null;
+
+    var ep = episodeFromPath(raw);
+    if (mediaType === 'tv') {
+      if (!ep) return null;
+      var wantSeason = parseInt(season, 10) || null;
+      var wantEpisode = parseInt(episode, 10) || null;
+      if (wantSeason && ep.season && ep.season !== wantSeason) return null;
+      if (wantEpisode && ep.episode !== wantEpisode) return null;
+      ep.season = ep.season || wantSeason || 1;
+    }
+
+    return {
+      href: href,
+      url: /^https?:\/\//i.test(href) ? href : origin + href,
+      origin: origin,
+      rootHref: rootHref,
+      raw: raw,
+      title: fileScore >= folderScore ? fileLabel : folderLabel,
+      titleLabel: fileScore >= folderScore ? fileLabel : folderLabel,
+      fileLabel: fileLabel,
+      folderLabel: folderLabel,
+      year: year,
+      score: score,
+      exact: exact,
+      episode: ep
+    };
+  }
+
+  async function h5aiServersStreams(servers, sourceName, info, mediaType, season, episode, disabledId) {
     if (disabled(disabledId)) return [];
-    if (!info.titles || !info.titles.length) return [];
-
-    var hrefs = [];
-    var queries = [];
-    var titles = info.titles.slice(0, 3);
-    for (var t = 0; t < titles.length; t++) {
-      var title = titles[t];
-      if (queries.indexOf(title) < 0) queries.push(title);
-      // h5ai uses literal substring matching: punctuation in TMDB titles
-      // (e.g. "Ada Twist, Scientist") often appears in folder names but not
-      // in video filenames, which drop commas/colons. Add stripped variants.
-      var stripped = String(title).replace(/[,:;!?'\u2019]/g, '').replace(/\s+/g, ' ').trim();
-      if (stripped !== title && queries.indexOf(stripped) < 0) queries.push(stripped);
-      var words = String(title).split(/\s+/).filter(function (w) { return w.length > 2; });
-      if (words.length > 2) {
-        var shortQuery = words.slice(0, 2).join(' ');
-        if (queries.indexOf(shortQuery) < 0) queries.push(shortQuery);
-      }
+    if (!info || !info.titles || !info.titles.length) return [];
+    var list = [];
+    for (var s = 0; s < (servers || []).length; s++) {
+      var server = servers[s];
+      if (server && server.origin && server.root) list.push(server);
     }
-    for (var q = 0; q < queries.length; q++) {
-      try {
-        var found = await h5aiSearch(origin, rootHref, queries[q]);
-        for (var f = 0; f < found.length; f++) {
-          if (hrefs.indexOf(found[f]) < 0) hrefs.push(found[f]);
-        }
-      } catch (e) { /* source down: skip */ }
-    }
+    if (!list.length) return [];
 
+    // h5ai performs literal substring matching. Search all servers with the
+    // full title plus stripped, dotted, underscored and escaped-space forms.
+    var queries = searchTerms(info, 6, true);
+    if (info.imdbId && queries.indexOf(info.imdbId) < 0) queries.push(info.imdbId);
+
+    var seen = {};
     var candidates = [];
-    for (var i = 0; i < hrefs.length; i++) {
-      var href = hrefs[i];
-      if (!isVideo(href)) continue;
-      var raw = decodePath(href);
-      var parts = raw.split('/');
-      // Episode files often sit in generic "Season 1" folders. Walk up to
-      // the first meaningful folder (usually the release/show folder).
-      var folder = '';
-      for (var p = parts.length - 2; p >= 0; p--) {
-        if (!parts[p]) continue;
-        if (/^(season|episodes?|s\d{1,2})$/i.test(parts[p])) continue;
-        folder = parts[p];
-        break;
-      }
-      var fileLabel = cleanName(parts[parts.length - 1]);
-      var label = cleanName(folder || parts[parts.length - 1]);
-      var year = yearOf(raw) || yearOf(folder);
-      var score = Math.max(scoreMatch(label, year, info), scoreMatch(fileLabel, year, info));
-      if (score >= 40 || info.titles.length === 0) {
-        candidates.push({ href: href, label: label, raw: raw, score: score });
-      }
-    }
+    var exactCount = 0;
 
-    candidates.sort(function (a, b) { return b.score - a.score; });
-
-    var out = [];
-    var wantedSeason = parseInt(season, 10) || null;
-    var wantedEpisode = parseInt(episode, 10) || null;
-    for (var c = 0; c < candidates.length && out.length < 10; c++) {
-      var cand = candidates[c];
-      var ep = episodeOf(cand.raw);
-      if (mediaType === 'tv' && ep && wantedSeason && wantedEpisode) {
-        if (ep.season !== wantedSeason || ep.episode !== wantedEpisode) continue;
-      }
-      var title = cand.label;
-      if (mediaType === 'tv') {
-        title = (ep ? 'S' + pad2(ep.season) + 'E' + pad2(ep.episode) : 'S' + pad2(wantedSeason || 1) + 'E' + pad2(wantedEpisode || 1)) + ' • ' + title;
-      }
-      out.push(makeStream({
-        name: sourceName,
-        title: title,
-        url: /^https?:\/\//i.test(cand.href) ? cand.href : origin + cand.href,
-        quality: qualityOf(cand.raw),
-        headers: { 'User-Agent': UA, 'Referer': origin + '/' },
-        match: cand.score,
-        exact: exactMatch(cand.label, cand.year, info)
+    // Query the useful title variants across all servers at once, then only
+    // fall back to weak prefixes when those produced no exact file.
+    async function batchesFor(query) {
+      return Promise.all(list.map(async function (entry) {
+        try {
+          return { server: entry, hrefs: await h5aiSearch(entry.origin, entry.root, query) };
+        } catch (e) {
+          return { server: entry, hrefs: [] };
+        }
       }));
     }
-    return dedupe(out);
+    function collect(batches) {
+      for (var b = 0; b < batches.length; b++) {
+        var batch = batches[b];
+        for (var h = 0; h < batch.hrefs.length; h++) {
+          var cand = h5aiCandidate(batch.hrefs[h], batch.server.origin, batch.server.root,
+            info, mediaType, season, episode);
+          if (!cand || seen[cand.url]) continue;
+          seen[cand.url] = true;
+          candidates.push(cand);
+          if (cand.exact) exactCount++;
+        }
+      }
+    }
+
+    var primaryResults = await Promise.all(queries.slice(0, 3).map(function (query) {
+      return batchesFor(query);
+    }));
+    for (var p = 0; p < primaryResults.length; p++) collect(primaryResults[p]);
+
+    for (var q = 3; q < queries.length && candidates.length < 40 && exactCount === 0; q++) {
+      collect(await batchesFor(queries[q]));
+    }
+    if (!candidates.length) return [];
+
+    var groups = groupExact(candidates, info);
+    var ordered = [];
+    for (var g = 0; g < groups.length; g++) {
+      for (var it = 0; it < groups[g].items.length; it++) ordered.push(groups[g].items[it]);
+    }
+    var probeList = ordered.slice(0, 12);
+    var sizes = await Promise.all(probeList.map(function (c) {
+      return probeSize(c.url, videoHeaders(c.origin, { 'Referer': c.origin + c.rootHref }));
+    }));
+
+    var out = [];
+    for (var i = 0; i < probeList.length; i++) {
+      var c = probeList[i];
+      var label = c.titleLabel;
+      if (mediaType === 'tv' && c.episode) {
+        label = 'S' + pad2(c.episode.season) + 'E' + pad2(c.episode.episode) + ' • ' + label;
+      }
+      var size = sizes[i] || null;
+      var stream = makeStream({
+        name: sourceName,
+        title: label,
+        url: c.url,
+        quality: qualityOf(c.raw),
+        detail: { raw: c.raw, size: size },
+        headers: videoHeaders(c.origin, { 'Referer': c.origin + c.rootHref }),
+        match: c.score,
+        exact: c.exact
+      });
+      if (stream) out.push(stream);
+    }
+    return rankStreams(out, info);
+  }
+
+  async function h5aiStreams(origin, rootHref, sourceName, info, mediaType, season, episode, disabledId) {
+    return h5aiServersStreams(
+      [{ origin: origin, root: rootHref }],
+      sourceName, info, mediaType, season, episode, disabledId
+    );
   }
 
   return {
     UA: UA,
     MAX_STREAMS: MAX_STREAMS,
+    MAX_PER_QUALITY: MAX_PER_QUALITY,
+    MAX_PER_HOST: MAX_PER_HOST,
     disabled: disabled,
     fetchText: fetchText,
     fetchJson: fetchJson,
     postJson: postJson,
+    tryHosts: tryHosts,
     decodeEntities: decodeEntities,
     decodePath: decodePath,
     decodeEscaped: decodeEscaped,
@@ -641,12 +967,28 @@ var DF = (function () {
     formatSize: formatSize,
     detailParts: detailParts,
     formatDetails: formatDetails,
+    browserHeaders: browserHeaders,
+    videoHeaders: videoHeaders,
+    hostOf: hostOf,
+    isBroken: isBroken,
+    sortTag: sortTag,
+    applySortTags: applySortTags,
+    limitStreams: limitStreams,
+    groupExact: groupExact,
+    orderedCandidates: orderedCandidates,
+    hydrateMany: hydrateMany,
+    firstNumber: firstNumber,
+    episodeSourceText: episodeSourceText,
+    seasonOfEpisode: seasonOfEpisode,
+    episodeNumberOf: episodeNumberOf,
+    episodeLinks: episodeLinks,
     pad2: pad2,
     exactMatch: exactMatch,
     strictScore: strictScore,
     strictPick: strictPick,
     probeSize: probeSize,
     episodeOf: episodeOf,
+    episodeFromPath: episodeFromPath,
     absoluteUrl: absoluteUrl,
     tmdbInfo: tmdbInfo,
     searchTerms: searchTerms,
@@ -658,6 +1000,8 @@ var DF = (function () {
     dedupe: dedupe,
     rankStreams: rankStreams,
     h5aiSearch: h5aiSearch,
-    h5aiStreams: h5aiStreams
+    h5aiCandidate: h5aiCandidate,
+    h5aiStreams: h5aiStreams,
+    h5aiServersStreams: h5aiServersStreams
   };
 })();

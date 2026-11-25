@@ -8,7 +8,7 @@ var WOW_SERIES = '/galleryForTv/tv_series/all/all';
 async function wowFetch(url) {
   var lastError;
   for (var attempt = 0; attempt < 3; attempt++) {
-    try { return await DF.fetchText(url); }
+    try { return await DF.fetchText(url, DF.browserHeaders(WOW_ORIGIN)); }
     catch (e) { lastError = e; }
   }
   throw lastError;
@@ -83,17 +83,21 @@ function wowMovieSources(html) {
   var re = /<source[^>]+src=["']([^"']+)["'][^>]*>/gi;
   while ((m = re.exec(String(html || ''))) !== null) {
     var src = DF.decodeEntities(m[1]);
-    if (/^https?:\/\//i.test(src) && !wowHasUrl(out, src)) out.push({ label: '', url: src });
+    if (/^https?:\/\//i.test(src) && !DF.isBroken(src) && !wowHasUrl(out, src)) {
+      out.push({ label: '', url: src });
+    }
   }
   var dre = /(?:href=["']([^"']+)["'][^>]*class=["'][^"']*header__download|class=["'][^"']*header__download[^"']*["'][^>]*href=["']([^"']+)["'])/gi;
   while ((m = dre.exec(String(html || ''))) !== null) {
     var dl = DF.decodeEntities(m[1] || m[2]);
-    if (/^https?:\/\//i.test(dl) && !wowHasUrl(out, dl)) out.push({ label: '', url: dl });
+    if (/^https?:\/\//i.test(dl) && !DF.isBroken(dl) && !wowHasUrl(out, dl)) {
+      out.push({ label: '', url: dl });
+    }
   }
   var mkvRe = /["'](https?:\/\/[^"']+\.mkv(?:\?[^"']*)?)["']/gi;
   while ((m = mkvRe.exec(String(html || ''))) !== null) {
     var mkv = DF.decodeEntities(m[1]);
-    if (!wowHasUrl(out, mkv)) out.push({ label: '', url: mkv });
+    if (!DF.isBroken(mkv) && !wowHasUrl(out, mkv)) out.push({ label: '', url: mkv });
   }
   return out;
 }
@@ -108,7 +112,7 @@ function wowEpisodes(html) {
     var playMatch = row.match(/play_video\(\s*['"]([^'"]+)['"]\s*\)/i);
     var dlMatch = row.match(/header__download[^>]*href=["']([^"']+)["']/i);
     var url = playMatch ? DF.decodeEntities(playMatch[1]) : (dlMatch ? DF.decodeEntities(dlMatch[1]) : '');
-    if (!url || !/^https?:\/\//i.test(url)) continue;
+    if (!url || !/^https?:\/\//i.test(url) || DF.isBroken(url)) continue;
     out.push({
       label: labelMatch ? DF.stripTags(labelMatch[1]) : '',
       url: url
@@ -128,58 +132,62 @@ async function getStreams(tmdbId, mediaType, season, episode) {
     : [{ path: '/', pages: 1 }, { path: WOW_MOVIES, pages: 10 }, { path: WOW_RECENT, pages: 6 }];
   var candidates = [];
   var seen = {};
-  for (var p = 0; p < paths.length && candidates.length < DF.MAX_STREAMS; p++) {
-    var found = await wowCrawl(paths[p].path, info, paths[p].pages, DF.MAX_STREAMS);
-    for (var f = 0; f < found.length && candidates.length < DF.MAX_STREAMS; f++) {
+  for (var p = 0; p < paths.length && candidates.length < 8; p++) {
+    var found = await wowCrawl(paths[p].path, info, paths[p].pages, 8);
+    for (var f = 0; f < found.length && candidates.length < 8; f++) {
       if (seen[found[f].href]) continue;
       seen[found[f].href] = true;
       candidates.push(found[f]);
     }
   }
 
-  var chosen = DF.pickBest(candidates, info, DF.MAX_STREAMS, 0);
+  var chosen = DF.orderedCandidates(candidates, info, 8);
   if (!chosen.length) return [];
 
-  var headers = { 'User-Agent': DF.UA, 'Referer': WOW_ORIGIN + '/' };
-  var out = [];
-  for (var k = 0; k < chosen.length && out.length < DF.MAX_STREAMS; k++) {
-    var pageHtml;
-    try { pageHtml = await wowFetch(chosen[k].href); }
-    catch (e) { continue; }
-
+  var playHeaders = DF.videoHeaders(WOW_ORIGIN);
+  var batches = await DF.hydrateMany(chosen, async function (candidate) {
+    var found = [];
+    var pageHtml = await wowFetch(candidate.href);
     var items = isTv ? wowEpisodes(pageHtml) : wowMovieSources(pageHtml);
     var wantedSeason = parseInt(season, 10) || null;
     var wantedEpisode = parseInt(episode, 10) || null;
 
-    for (var i = 0; i < items.length && out.length < DF.MAX_STREAMS; i++) {
+    for (var i = 0; i < items.length && found.length < 8; i++) {
       var item = items[i];
-      var label = chosen[k].title;
+      var label = candidate.title;
       if (isTv) {
-        var ep = DF.episodeOf(item.label) || DF.episodeOf(item.url);
+        var ep = DF.episodeFromPath(item.label + ' ' + item.url) ||
+          DF.episodeFromPath(candidate.href);
         if (ep) {
-          if (wantedSeason && ep.season !== wantedSeason) continue;
+          if (wantedSeason && ep.season && ep.season !== wantedSeason) continue;
           if (wantedEpisode && ep.episode !== wantedEpisode) continue;
-          label = 'S' + DF.pad2(ep.season) + 'E' + DF.pad2(ep.episode) + ' • ' +
-            (item.label || chosen[k].title);
+          label = 'S' + DF.pad2(ep.season || wantedSeason || 1) + 'E' +
+            DF.pad2(ep.episode || wantedEpisode || 1) + ' • ' + (item.label || candidate.title);
         } else {
-          label = 'S' + DF.pad2(wantedSeason || 1) + 'E' + DF.pad2(wantedEpisode || 1) + ' • ' +
-            chosen[k].title;
+          label = 'S' + DF.pad2(wantedSeason || 1) + 'E' +
+            DF.pad2(wantedEpisode || 1) + ' • ' + candidate.title;
         }
       }
       var raw = label + ' ' + DF.decodePath(item.url);
-      var size = await DF.probeSize(item.url, headers);
+      var size = await DF.probeSize(item.url, playHeaders);
       var stream = DF.makeStream({
         name: 'WoW Movie Zone',
         title: label,
         url: item.url,
         quality: DF.qualityOf(raw),
         detail: { raw: raw, size: size },
-        headers: headers,
-        match: chosen[k].score,
-        exact: chosen[k].exact
+        headers: playHeaders,
+        match: candidate.score,
+        exact: candidate.exact
       });
-      if (stream) out.push(stream);
+      if (stream) found.push(stream);
     }
+    return found;
+  });
+
+  var out = [];
+  for (var b = 0; b < batches.length && out.length < 16; b++) {
+    for (var k = 0; k < batches[b].length && out.length < 16; k++) out.push(batches[b][k]);
   }
   return DF.rankStreams(DF.dedupe(out), info);
 }

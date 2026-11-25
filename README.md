@@ -6,7 +6,7 @@ On-device Nuvio scrapers for mainstream BDIX movie and series providers. No back
 
 - **Full/sideloaded Nuvio build** (Play Store builds disable plugins).
 - Internet access for public sites and TMDB metadata.
-- For **WoW Movie Zone**, the device must be on the same LAN/VPN as `172.27.27.84` / `172.27.27.239`.
+- For **DhakaFlix** (`172.16.50.7`, `.10`, `.12`, `.14`) and **WoW Movie Zone** (`172.27.27.84` / `172.27.27.239`), the device must be on the same LAN/VPN.
 
 ## Install
 
@@ -21,6 +21,7 @@ If testing locally, run `node test/serve.js` and add `http://<your-pc-ip>:8787/m
 
 | ID | Name | Types | Notes |
 |----|------|-------|-------|
+| `dhakaflix` | DhakaFlix | movie, tv | Multi-server h5ai library; all video folders; LAN/VPN required |
 | `flixhub` | FlixHub | movie, tv | High-speed direct streams |
 | `cineplex` | CinePlex | movie, tv | Freshly resolved signed links on every play |
 | `cinemax24` | Cinemax24 | movie, tv | Strict TMDB-ID/title+year matching |
@@ -28,7 +29,7 @@ If testing locally, run `node test/serve.js` and add `http://<your-pc-ip>:8787/m
 | `ctghall` | CTGHall | movie, tv | Exact-TMDB movie and episode links |
 | `wow-movie-zone` | WoW Movie Zone | movie, tv | Local-network direct files; LAN/VPN required |
 
-CTGHall is a separate source from CTGMovies; CTGMovies and all DhakaFlix scrapers are no longer part of this plugin.
+CTGHall is a separate source from CTGMovies. DhakaFlix is a dedicated multi-server scraper covering `.7`, `.10`, `.12` and `.14`; `.4` is only the portal and `.8` is games/software, so both are excluded.
 
 ## Stream information
 
@@ -53,12 +54,13 @@ If a source has only one exact file and no same-title variants, the provider ret
 
 Each provider implements `getStreams(tmdbId, mediaType, season, episode)`:
 
-1. Nuvio injects `TMDB_API_KEY`; the plugin fetches the title/year from TMDB.
-2. The provider searches the target site or API with the full title, then short prefix terms when more variants are needed.
-3. Candidates are scored by exact TMDB ID, normalized title+year, then closest title. Streams are ranked by match quality, language, resolution, dual-audio, and size before the 5-stream cap.
-4. Direct video URLs are returned as Nuvio stream objects with required headers, visible metadata-rich names, and metadata-rich titles.
+1. Nuvio injects `TMDB_API_KEY`; the plugin fetches the title, year, original language and IMDb ID (`external_ids`) from TMDB.
+2. The provider searches with full titles, punctuation-stripped forms, dotted/underscored/escaped-space variants, short prefixes and (where useful) the IMDb ID.
+3. All candidates are grouped by normalized title + year before detail pages are hydrated in parallel. Exact TMDB/IMDb/title+year matches are collected first; close-title fallbacks are considered only afterwards.
+4. Broken links are skipped. Streams are ranked by exactness, language, resolution, dual-audio, file size and match score, with a cap per quality/host so five near-duplicates cannot crowd out variants.
+5. Direct video URLs are returned as Nuvio stream objects with required headers, visible metadata-rich names, populated `size` metadata, and metadata-rich titles.
 
-All scraper logic is bundled into standalone CommonJS files in `providers/`. The shared core (`src/core.js`) is concatenated into each generated provider by `build.js` so every provider is self-contained.
+All scraper logic is bundled into standalone CommonJS files in `providers/`. The shared core (`src/core.js`) is concatenated into each generated provider by `build.js` so every provider is self-contained. An invisible sort prefix is included as a safeguard if Nuvio re-sorts stream rows visually; array order is still authoritative.
 
 ## Development
 
@@ -96,7 +98,7 @@ test/serve.js          # Local static server for manifest
 The generated providers are QuickJS/Hermes-safe:
 
 - Uses `fetch`, no Node-only APIs.
-- No timers, no `Buffer`, no `arrayBuffer`.
+- No Node-only APIs (`Buffer`, Node timers, Cheerio); only `fetch`, `AbortController`, regex and JSON parsing.
 - No Cheerio dependency — regex/JSON parsing only.
 - Uses `globalThis.TMDB_API_KEY` for TMDB metadata.
 
@@ -106,4 +108,6 @@ The generated providers are QuickJS/Hermes-safe:
 - If a source is down, its provider simply returns no streams; other providers still work.
 - CinePlex signed URLs expire, so they are resolved fresh on every search/play.
 - WoW Movie Zone's built-in search endpoint is unreliable, so it crawls the gallery pages and matches titles locally.
+- DhakaFlix queries all four h5ai roots in parallel, dedupes by file URL and accepts all video folders; it does not scrape the `.4` portal.
+- Search terms include dotted, underscored and escaped-space forms to catch FTP-style filenames used by h5ai libraries.
 - Private IP sources only work when the device shares the same LAN/VPN.
